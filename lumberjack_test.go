@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
-	"gopkg.in/yaml.v2"
+	"github.com/dvln/toml"
+	"github.com/dvln/yaml"
 )
 
 // !!!NOTE!!!
@@ -160,6 +160,64 @@ func TestAutoRotate(t *testing.T) {
 	// the backup file will use the current fake time and have the old contents.
 	existsWithLen(backupFile(dir), len(b), t)
 
+	fileCount(dir, 2, t)
+}
+
+func TestDailyRotate(t *testing.T) {
+	currentTime = fakeTime
+	megabyte = 1024 * 1024
+
+	dir := makeTempDir("TestDailyRotate", t)
+	defer os.RemoveAll(dir)
+
+	filename := logFile(dir)
+	l := &Logger{
+		Filename:    filename,
+		MaxSize:     10,
+		DailyRotate: true,
+		LocalTime:   true,
+	}
+	defer l.Close()
+	b := []byte("boo!")
+	n, err := l.Write(b)
+	isNil(err, t)
+	equals(len(b), n, t)
+	info, err := osStat(filename)
+	isNil(err, t)
+	existsWithLen(filename, n, t)
+	fileCount(dir, 1, t)
+
+	// Make the log file timestamp a couple of days old, grab that time
+	//mtime := info.ModTime().Sub(time.Hour * 24 * 2)
+	mtime := info.ModTime().Add(-24 * 2 * time.Hour)
+	atime := mtime
+	err = os.Chtimes(filename, atime, mtime)
+	isNil(err, t)
+	info, err = osStat(filename)
+	isNil(err, t)
+	origModTime := info.ModTime() // 2 day old log file roughly
+	origTimestamp := origModTime.Format(backupTimeFormat)
+	basedir := filepath.Dir(filename)
+	nameonly := filepath.Base(filename)
+	ext := filepath.Ext(nameonly)
+	pfx := nameonly[:len(nameonly)-len(ext)]
+	expectedBackupFile := filepath.Join(basedir, fmt.Sprintf("%s-%s%s", pfx, origTimestamp, ext))
+
+	b2 := []byte("foooooo!")
+	n, err = l.Write(b2)
+	isNil(err, t)
+	equals(len(b2), n, t)
+
+	existsWithLen(filename, n, t)
+	existsWithLen(expectedBackupFile, len(b), t)
+	fileCount(dir, 2, t)
+
+	b3 := []byte("one more!")
+	n3, err := l.Write(b3)
+	isNil(err, t)
+	equals(len(b3), n3, t)
+
+	existsWithLen(filename, n+n3, t)
 	fileCount(dir, 2, t)
 }
 

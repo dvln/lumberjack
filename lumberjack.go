@@ -1,11 +1,12 @@
 // Package lumberjack provides a rolling logger.
 //
-// Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
-// thusly:
+// Note that this is formed from Nate Finch's version, this version has Nate's
+// v2.0 back on master along with some local changes (ie: daily rotation
+// mechanism added).  To use the dvln version:
 //
-//   import "gopkg.in/natefinch/lumberjack.v2"
+//   import "github.com/dvln/lumberjack"
 //
-// The package name remains simply lumberjack, and the code resides at
+// The original code resides here:
 // https://github.com/natefinch/lumberjack under the v2.0 branch.
 //
 // Lumberjack is intended to be one part of a logging infrastructure.
@@ -87,28 +88,55 @@ type Logger struct {
 	// deleted.)
 	MaxBackups int `json:"maxbackups" yaml:"maxbackups"`
 
+	// DailyRotate indicates we wish to rotate the file if the date changes
+	// either in local time or UTC time depending upon the Localtime setting
+	DailyRotate bool `json:"dailyrotate" yaml:"dailyrotate"`
+
 	// LocalTime determines if the time used for formatting the timestamps in
 	// backup files is the computer's local time.  The default is to use UTC
 	// time.
 	LocalTime bool `json:"localtime" yaml:"localtime"`
 
-	size int64
-	file *os.File
-	mu   sync.Mutex
+	lastLogWriteTime *time.Time
+	size             int64
+	file             *os.File
+	mu               sync.Mutex
 }
 
 var (
 	// currentTime exists so it can be mocked out by tests.
 	currentTime = time.Now
 
-	// os_Stat exists so it can be mocked out by tests.
-	os_Stat = os.Stat
+	// osStat exists so it can be mocked out by tests.
+	osStat = os.Stat
 
 	// megabyte is the conversion factor between MaxSize and bytes.  It is a
 	// variable so tests can mock it out and not need to write megabytes of data
 	// to disk.
 	megabyte = 1024 * 1024
 )
+
+// newDayDetected checks if the logfile exists and, if so, if a new days
+// boundary has been crossed... indicates true or false
+func (l *Logger) newDayDetected() bool {
+	haveNewDay := false
+	info, err := osStat(l.filename())
+	if err == nil {
+		currTime := time.Now()
+		modTime := info.ModTime()
+		if !l.LocalTime {
+			currTime = currTime.UTC()
+			modTime = modTime.UTC()
+		}
+		logfileYr, logfileMo, logfileDy := modTime.Date()
+		currYr, currMo, currDy := currTime.Date()
+		if currYr != logfileYr || currMo != logfileMo || currDy != logfileDy {
+			l.lastLogWriteTime = &modTime
+			haveNewDay = true
+		}
+	}
+	return haveNewDay
+}
 
 // Write implements io.Writer.  If a write would cause the log file to be larger
 // than MaxSize, the file is closed, renamed to include a timestamp of the
@@ -131,7 +159,11 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 		}
 	}
 
-	if l.size+writeLen > l.max() {
+	if l.DailyRotate && l.newDayDetected() {
+		if err := l.rotate(); err != nil {
+			return 0, err
+		}
+	} else if l.size+writeLen > l.max() {
 		if err := l.rotate(); err != nil {
 			return 0, err
 		}
@@ -173,7 +205,7 @@ func (l *Logger) Rotate() error {
 
 // rotate closes the current file, moves it aside with a timestamp in the name,
 // (if it exists), opens a new file with the original filename, and then runs
-// cleanup.
+// cleanup.  Note: This should be run within a mutex lock on the Logger
 func (l *Logger) rotate() error {
 	if err := l.close(); err != nil {
 		return err
@@ -188,19 +220,18 @@ func (l *Logger) rotate() error {
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
 func (l *Logger) openNew() error {
-	err := os.MkdirAll(l.dir(), 0744)
+	err := os.MkdirAll(l.dir(), 0774)
 	if err != nil {
 		return fmt.Errorf("can't make directories for new logfile: %s", err)
 	}
 
 	name := l.filename()
-	mode := os.FileMode(0644)
-	info, err := os_Stat(name)
+	mode := os.FileMode(0664)
+	info, err := osStat(name)
 	if err == nil {
 		// Copy the mode off the old logfile.
 		mode = info.Mode()
-		// move the existing file
-		newname := backupName(name, l.LocalTime)
+		newname := l.backupName(name)
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
@@ -225,17 +256,27 @@ func (l *Logger) openNew() error {
 
 // backupName creates a new filename from the given name, inserting a timestamp
 // between the filename and the extension, using the local time if requested
-// (otherwise UTC).
-func backupName(name string, local bool) string {
+// (otherwise UTC).  Note that the timestamp for daily logfile rotation will
+// not be the current time but will instead by the last mod time on the log
+// file that is going to be rotated out (ie: that is the log data for that
+// day basically, so tag it with the day is was written to, not today).
+func (l *Logger) backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
 	ext := filepath.Ext(filename)
 	prefix := filename[:len(filename)-len(ext)]
-	t := currentTime()
-	if !local {
+	var t time.Time
+	// If daily rotate is active and we have a last mod time set that means that
+	// this rotation is due to the day changing (not, for example, a size limit)
+	if l.DailyRotate && l.lastLogWriteTime != nil {
+		t = *l.lastLogWriteTime  // copy the last mod time for the timestamp
+		l.lastLogWriteTime = nil // and clear it for the next go pass
+	} else {
+		t = currentTime()
+	}
+	if !l.LocalTime {
 		t = t.UTC()
 	}
-
 	timestamp := t.Format(backupTimeFormat)
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
@@ -245,7 +286,7 @@ func backupName(name string, local bool) string {
 // put it over the MaxSize, a new file is created.
 func (l *Logger) openExistingOrNew(writeLen int) error {
 	filename := l.filename()
-	info, err := os_Stat(filename)
+	info, err := osStat(filename)
 	if os.IsNotExist(err) {
 		return l.openNew()
 	}

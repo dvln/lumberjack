@@ -47,11 +47,11 @@ func TestMaintainMode(t *testing.T) {
 
 func TestMaintainOwner(t *testing.T) {
 	fakeC := fakeChown{}
-	os_Chown = fakeC.Set
-	os_Stat = fakeStat
+	osChown = fakeC.Set
+	osStat = fakeStat
 	defer func() {
-		os_Chown = os.Chown
-		os_Stat = os.Stat
+		osChown = os.Chown
+		osStat = os.Stat
 	}()
 	currentTime = fakeTime
 	dir := makeTempDir("TestMaintainOwner", t)
