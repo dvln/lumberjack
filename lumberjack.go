@@ -35,12 +35,16 @@ import (
 )
 
 const (
-	backupTimeFormat = "2006-01-02T15-04-05.000"
-	defaultMaxSize   = 100
+	defaultMaxSize = 100
 )
 
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
+
+var (
+	mutex sync.RWMutex
+	backupTimeFormat = "2006-01-02T15-04-05.000"
+)
 
 // Logger is an io.WriteCloser that writes to the specified filename.
 //
@@ -118,6 +122,7 @@ var (
 
 // newDayDetected checks if the logfile exists and, if so, if a new days
 // boundary has been crossed... indicates true or false
+// Note: this is expected to be within a l.mu.Lock() from a caller
 func (l *Logger) newDayDetected() bool {
 	haveNewDay := false
 	info, err := osStat(l.filename())
@@ -260,6 +265,7 @@ func (l *Logger) openNew() error {
 // not be the current time but will instead by the last mod time on the log
 // file that is going to be rotated out (ie: that is the log data for that
 // day basically, so tag it with the day is was written to, not today).
+// Note: this is expected to be within a l.mu.Lock() from a caller
 func (l *Logger) backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
@@ -277,6 +283,8 @@ func (l *Logger) backupName(name string) string {
 	if !l.LocalTime {
 		t = t.UTC()
 	}
+	mutex.RLock()
+	defer mutex.RUnlock()
 	timestamp := t.Format(backupTimeFormat)
 	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
 }
@@ -320,6 +328,7 @@ func (l *Logger) filename() string {
 
 // cleanup deletes old log files, keeping at most l.MaxBackups files, as long as
 // none of them are older than MaxAge.
+// Note: this is expected to be within a l.mu.Lock() from a caller
 func (l *Logger) cleanup() error {
 	if l.MaxBackups == 0 && l.MaxAge == 0 {
 		return nil
@@ -384,6 +393,8 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 		if name == "" {
 			continue
 		}
+	mutex.RLock()
+	defer mutex.RUnlock()
 		t, err := time.Parse(backupTimeFormat, name)
 		if err == nil {
 			logFiles = append(logFiles, logInfo{t, f})
@@ -456,3 +467,20 @@ func (b byFormatTime) Swap(i, j int) {
 func (b byFormatTime) Len() int {
 	return len(b)
 }
+
+// BackupTimeFormat gets the current backup time format
+func (l *Logger) BackupTimeFormat() (string) {
+	mutex.RLock()
+	defer mutex.RUnlock()
+	return backupTimeFormat
+}
+
+// SetBackupTimeFormat allows a client of lumberjack to override the default
+// time format for naming when rotating log files, default time format is
+// currently: "2006-01-02T15-04-05.000" (see godoc for time package, Parse())
+func (l *Logger) SetBackupTimeFormat(format string) {
+	mutex.Lock()
+	defer mutex.Unlock()
+	backupTimeFormat = format
+}
+

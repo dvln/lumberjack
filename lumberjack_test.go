@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
@@ -137,6 +138,7 @@ func TestAutoRotate(t *testing.T) {
 		Filename: filename,
 		MaxSize:  10,
 	}
+
 	defer l.Close()
 	b := []byte("boo!")
 	n, err := l.Write(b)
@@ -153,13 +155,11 @@ func TestAutoRotate(t *testing.T) {
 	isNil(err, t)
 	equals(len(b2), n, t)
 
-	// the old logfile should be moved aside and the main logfile should have
+	// The old logfile should be moved aside and the main logfile should have
 	// only the last write in it.
 	existsWithLen(filename, n, t)
-
-	// the backup file will use the current fake time and have the old contents.
+	// The backup file will use the current fake time and have the old contents.
 	existsWithLen(backupFile(dir), len(b), t)
-
 	fileCount(dir, 2, t)
 }
 
@@ -177,6 +177,15 @@ func TestDailyRotate(t *testing.T) {
 		DailyRotate: true,
 		LocalTime:   true,
 	}
+	// Try out the formatter override, should result in just the date
+	origTimeFmt := l.BackupTimeFormat()
+	newTimeFmt := "2006-01-02"
+	l.SetBackupTimeFormat(newTimeFmt)
+	chkTimeFmt := l.BackupTimeFormat()
+	if chkTimeFmt != newTimeFmt {
+		t.Fatalf("Backup time format bad, found: %s, expected: %s\n", chkTimeFmt, newTimeFmt)
+	}
+
 	defer l.Close()
 	b := []byte("boo!")
 	n, err := l.Write(b)
@@ -188,7 +197,6 @@ func TestDailyRotate(t *testing.T) {
 	fileCount(dir, 1, t)
 
 	// Make the log file timestamp a couple of days old, grab that time
-	//mtime := info.ModTime().Sub(time.Hour * 24 * 2)
 	mtime := info.ModTime().Add(-24 * 2 * time.Hour)
 	atime := mtime
 	err = os.Chtimes(filename, atime, mtime)
@@ -201,7 +209,13 @@ func TestDailyRotate(t *testing.T) {
 	nameonly := filepath.Base(filename)
 	ext := filepath.Ext(nameonly)
 	pfx := nameonly[:len(nameonly)-len(ext)]
+
 	expectedBackupFile := filepath.Join(basedir, fmt.Sprintf("%s-%s%s", pfx, origTimestamp, ext))
+
+	chkOnDate := regexp.MustCompile(`foobar-[\d]{4}-[\d]{2}-[\d]{2}.log$`)
+	if !chkOnDate.Match([]byte(expectedBackupFile)) {
+		t.Fatalf("Filename found: %s\nNot matching date-only name regex", expectedBackupFile)
+	}
 
 	b2 := []byte("foooooo!")
 	n, err = l.Write(b2)
@@ -219,6 +233,7 @@ func TestDailyRotate(t *testing.T) {
 
 	existsWithLen(filename, n+n3, t)
 	fileCount(dir, 2, t)
+	l.SetBackupTimeFormat(origTimeFmt)
 }
 
 func TestFirstWriteRotate(t *testing.T) {
