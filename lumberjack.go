@@ -1,18 +1,19 @@
 // Package lumberjack provides a rolling logger.
 //
-// Note that this is formed from Nate Finch's version, this version has Nate's
-// v2.0 back on master along with some local changes (ie: daily rotation
-// mechanism added).  To use the dvln version:
+// Note that for dvln purposes the "master" branch was renamed to "oldmaster"
+// and then "master" was removed and re-created to first point at a "v2.0" copy
+// but it later divered with the additions covered in the README.md file.  The
+// use of master makes the simplest go get.  To import:
 //
 //   import "github.com/dvln/lumberjack"
 //
-// The original code resides here:
-// https://github.com/natefinch/lumberjack under the v2.0 branch.
+// The central/master package resides here:
+//   https://github.com/natefinch/lumberjack under the v2.0 branch.
 //
 // Lumberjack is intended to be one part of a logging infrastructure.
 // It is not an all-in-one solution, but instead is a pluggable
-// component at the bottom of the logging stack that simply controls the files
-// to which logs are written.
+// component at the bottom of the logging stack that simply controls
+// the files to which logs are written.
 //
 // Lumberjack plays well with any logging package that can write to an
 // io.Writer, including the standard library's log package.
@@ -23,27 +24,35 @@
 package lumberjack
 
 import (
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
 const (
+	compressSuffix = ".gz"
 	defaultMaxSize = 100
 )
 
 // ensure we always implement io.WriteCloser
 var _ io.WriteCloser = (*Logger)(nil)
 
+// The normal lumberjack time was: "2006-01-02T15-04-05.000"
+// That has been modified to just date for dvln needs
 var (
-	mutex sync.RWMutex
-	backupTimeFormat = "2006-01-02T15-04-05.000"
+	mutex            sync.RWMutex
+	backupTimeFormat = "2006-01-02"
+	uniqNumExtRegex  = regexp.MustCompile(`(.*)\-\-\d+$`)
 )
 
 // Logger is an io.WriteCloser that writes to the specified filename.
@@ -59,6 +68,14 @@ var (
 // the current file is closed, renamed, and a new log file created with the
 // original name. Thus, the filename you give Logger is always the "current" log
 // file.
+//
+// Backups use the log file name given to Logger, in the form
+// `name-timestamp.ext` where name is the filename without the extension,
+// timestamp is the time at which the log was rotated formatted with the
+// time.Time format of `2006-01-02T15-04-05.000` and the extension is the
+// original extension.  For example, if your Logger.Filename is
+// `/var/log/foo/server.log`, a backup created at 6:30pm on Nov 11 2016 would
+// use the filename `/var/log/foo/server-2016-11-04T18-30-00.000.log`
 //
 // Cleaning Up Old Log Files
 //
@@ -101,10 +118,20 @@ type Logger struct {
 	// time.
 	LocalTime bool `json:"localtime" yaml:"localtime"`
 
+	// Compress determines if the rotated log files should be compressed
+	// using gzip. The default is not to perform compression.
+	Compress bool `json:"compress" yaml:"compress"`
+
+	size int64
+	file *os.File
+	mu   sync.Mutex
+
+	// Track the last write time to the log, support shifting at midnight
+	// boundary if DailyRotate above is active
 	lastLogWriteTime *time.Time
-	size             int64
-	file             *os.File
-	mu               sync.Mutex
+
+	millCh    chan bool
+	startMill sync.Once
 }
 
 var (
@@ -152,7 +179,7 @@ func (l *Logger) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 
 	writeLen := int64(len(p))
-	if writeLen > l.max() {
+	if l.MaxSize != -1 && writeLen > l.max() {
 		return 0, fmt.Errorf(
 			"write length %d exceeds maximum file size %d", writeLen, l.max(),
 		)
@@ -200,8 +227,8 @@ func (l *Logger) close() error {
 // Rotate causes Logger to close the existing log file and immediately create a
 // new one.  This is a helper function for applications that want to initiate
 // rotations outside of the normal rotation rules, such as in response to
-// SIGHUP.  After rotating, this initiates a cleanup of old log files according
-// to the normal rules.
+// SIGHUP.  After rotating, this initiates compression and removal of old log
+// files according to the configuration.
 func (l *Logger) Rotate() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -210,22 +237,24 @@ func (l *Logger) Rotate() error {
 
 // rotate closes the current file, moves it aside with a timestamp in the name,
 // (if it exists), opens a new file with the original filename, and then runs
-// cleanup.  Note: This should be run within a mutex lock on the Logger
+// post-rotation processing and removal.
 func (l *Logger) rotate() error {
 	if err := l.close(); err != nil {
 		return err
 	}
-
 	if err := l.openNew(); err != nil {
 		return err
 	}
-	return l.cleanup()
+	l.mill()
+	return nil
 }
 
 // openNew opens a new log file for writing, moving any old log file out of the
 // way.  This methods assumes the file has already been closed.
 func (l *Logger) openNew() error {
-	err := os.MkdirAll(l.dir(), 0774)
+	oldUmask := syscall.Umask(0)
+	defer syscall.Umask(oldUmask)
+	err := os.MkdirAll(l.dir(), 0775)
 	if err != nil {
 		return fmt.Errorf("can't make directories for new logfile: %s", err)
 	}
@@ -234,17 +263,47 @@ func (l *Logger) openNew() error {
 	mode := os.FileMode(0664)
 	info, err := osStat(name)
 	if err == nil {
-		// Copy the mode off the old logfile.
+		// copy the mode off the old logfile, generate time/date log file name,
+		// make sure it has a unique name so we do not overwrite a log file
+		// from the same day (eg: if doing daily rotation and limit log size
+		// to 2GB then mid-day a rotation might occur, then at 11pm another
+		// rotation after another 2GB of data, then at midnight another
+		// rotation... tool.log.2019-01-15 is midday, tool.log.2019-01-16--1
+		// is created at the 11pm rollover and tool.log.2019-01-16--2 is the
+		// final daily name rollover at midnight name.  If your date/time format
+		// results in a non-unique (already used) log file name this will insure
+		// an extension is added to avoid overwriting the file (if you have time
+		// and even milliseconds in play then this will not be used of course)
 		mode = info.Mode()
 		newname := l.backupName(name)
+		_, err = osStat(newname)
+		_, err2 := osStat(newname + compressSuffix)
+		if err == nil || err2 == nil {
+			// if a regular or compressed copy of the backupName is already in use
+			// then we'll need to add an extension before the rename happens..
+			for i := 0; i < 100; i++ {
+				checkName := fmt.Sprintf("%s--%d", newname, i+1)
+				_, err = osStat(checkName)
+				_, err2 = osStat(checkName + compressSuffix)
+				if err != nil && err2 != nil {
+					newname = checkName
+					break
+				}
+			}
+		}
+
+		// need to touch the mod time on the log file just before renaming it
+		// so we can insure sorting of log files does not have the time of the
+		// last log entry but instead has the time when it was renamed, roughly
+		currenttime := time.Now().Local()
+		_ = os.Chtimes(name, currenttime, currenttime)
+		// then rename it
 		if err := os.Rename(name, newname); err != nil {
 			return fmt.Errorf("can't rename log file: %s", err)
 		}
 
-		// this is a no-op anywhere but linux
-		if err := chown(name, info); err != nil {
-			return err
-		}
+		// this is a no-op anywhere but linux, on linux it is "best effort"
+		_ = chown(name, info)
 	}
 
 	// we use truncate here because this should only get called when we've moved
@@ -259,25 +318,27 @@ func (l *Logger) openNew() error {
 	return nil
 }
 
-// backupName creates a new filename from the given name, inserting a timestamp
-// between the filename and the extension, using the local time if requested
+// backupName creates a new filename from the given name by appending a
+// timestamp after the filename and the extension. Uses local time if requested
 // (otherwise UTC).  Note that the timestamp for daily logfile rotation will
 // not be the current time but will instead by the last mod time on the log
 // file that is going to be rotated out (ie: that is the log data for that
 // day basically, so tag it with the day is was written to, not today).
-// Note: this is expected to be within a l.mu.Lock() from a caller
+// Note1: this is expected to be within a l.mu.Lock() from a caller
+// Note2: dvln archive logfile naming format eg: "file.log.<date>"
+// Note3: this has been adjusted, the original Go pkg inserted the
+//        timestamp between the filename and the extension, this appends
 func (l *Logger) backupName(name string) string {
 	dir := filepath.Dir(name)
 	filename := filepath.Base(name)
-	ext := filepath.Ext(filename)
-	prefix := filename[:len(filename)-len(ext)]
 	var t time.Time
 	// If daily rotate is active and we have a last mod time set that means that
 	// this rotation is due to the day changing (not, for example, a size limit)
 	if l.DailyRotate && l.lastLogWriteTime != nil {
-		t = *l.lastLogWriteTime  // copy the last mod time for the timestamp
-		l.lastLogWriteTime = nil // and clear it for the next go pass
+		t = *l.lastLogWriteTime  // grab files last mod time for the timestamp
+		l.lastLogWriteTime = nil // and clear it for the next pass
 	} else {
+		// Interday backup, use extended format for any "within day" backups
 		t = currentTime()
 	}
 	if !l.LocalTime {
@@ -286,13 +347,15 @@ func (l *Logger) backupName(name string) string {
 	mutex.RLock()
 	defer mutex.RUnlock()
 	timestamp := t.Format(backupTimeFormat)
-	return filepath.Join(dir, fmt.Sprintf("%s-%s%s", prefix, timestamp, ext))
+	return filepath.Join(dir, fmt.Sprintf("%s.%s", filename, timestamp))
 }
 
 // openExistingOrNew opens the logfile if it exists and if the current write
 // would not put it over MaxSize.  If there is no such file or the write would
 // put it over the MaxSize, a new file is created.
 func (l *Logger) openExistingOrNew(writeLen int) error {
+	l.mill()
+
 	filename := l.filename()
 	info, err := osStat(filename)
 	if os.IsNotExist(err) {
@@ -306,7 +369,9 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 		return l.rotate()
 	}
 
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0644)
+	oldUmask := syscall.Umask(0)
+	defer syscall.Umask(oldUmask)
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY, 0664)
 	if err != nil {
 		// if we fail to open the old log file for some reason, just ignore
 		// it and open a new log file.
@@ -326,11 +391,12 @@ func (l *Logger) filename() string {
 	return filepath.Join(os.TempDir(), name)
 }
 
-// cleanup deletes old log files, keeping at most l.MaxBackups files, as long as
+// millRunOnce performs compression and removal of stale log files.
+// Log files are compressed if enabled via configuration and old log
+// files are removed, keeping at most l.MaxBackups files, as long as
 // none of them are older than MaxAge.
-// Note: this is expected to be within a l.mu.Lock() from a caller
-func (l *Logger) cleanup() error {
-	if l.MaxBackups == 0 && l.MaxAge == 0 {
+func (l *Logger) millRunOnce() error {
+	if l.MaxBackups == 0 && l.MaxAge == 0 && !l.Compress {
 		return nil
 	}
 
@@ -339,38 +405,87 @@ func (l *Logger) cleanup() error {
 		return err
 	}
 
-	var deletes []logInfo
+	var compress, remove []logInfo
 
 	if l.MaxBackups > 0 && l.MaxBackups < len(files) {
-		deletes = files[l.MaxBackups:]
-		files = files[:l.MaxBackups]
+		preserved := make(map[string]bool)
+		var remaining []logInfo
+		for _, f := range files {
+			// Only count the uncompressed log file or the
+			// compressed log file, not both.
+			fn := f.Name()
+			if strings.HasSuffix(fn, compressSuffix) {
+				fn = fn[:len(fn)-len(compressSuffix)]
+			}
+			preserved[fn] = true
+
+			if len(preserved) > l.MaxBackups {
+				remove = append(remove, f)
+			} else {
+				remaining = append(remaining, f)
+			}
+		}
+		files = remaining
 	}
 	if l.MaxAge > 0 {
 		diff := time.Duration(int64(24*time.Hour) * int64(l.MaxAge))
-
 		cutoff := currentTime().Add(-1 * diff)
 
+		var remaining []logInfo
 		for _, f := range files {
 			if f.timestamp.Before(cutoff) {
-				deletes = append(deletes, f)
+				remove = append(remove, f)
+			} else {
+				remaining = append(remaining, f)
+			}
+		}
+		files = remaining
+	}
+
+	if l.Compress {
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), compressSuffix) {
+				compress = append(compress, f)
 			}
 		}
 	}
 
-	if len(deletes) == 0 {
-		return nil
+	for _, f := range remove {
+		errRemove := os.Remove(filepath.Join(l.dir(), f.Name()))
+		if err == nil && errRemove != nil {
+			err = errRemove
+		}
+	}
+	for _, f := range compress {
+		fn := filepath.Join(l.dir(), f.Name())
+		errCompress := compressLogFile(fn, fn+compressSuffix)
+		if err == nil && errCompress != nil {
+			err = errCompress
+		}
 	}
 
-	go deleteAll(l.dir(), deletes)
-
-	return nil
+	return err
 }
 
-func deleteAll(dir string, files []logInfo) {
-	// remove files on a separate goroutine
-	for _, f := range files {
+// millRun runs in a goroutine to manage post-rotation compression and removal
+// of old log files.
+func (l *Logger) millRun() {
+	for _ = range l.millCh {
 		// what am I going to do, log this?
-		_ = os.Remove(filepath.Join(dir, f.Name()))
+		_ = l.millRunOnce()
+	}
+}
+
+// mill performs post-rotation compression and removal of stale log files,
+// starting the mill goroutine if necessary.
+func (l *Logger) mill() {
+	l.startMill.Do(func() {
+		l.millCh = make(chan bool, 1)
+		go l.millRun()
+	})
+	select {
+	case l.millCh <- true:
+	default:
 	}
 }
 
@@ -383,21 +498,26 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 	}
 	logFiles := []logInfo{}
 
+	// example: prefix is "tool", the ext is ".log"
 	prefix, ext := l.prefixAndExt()
-
 	for _, f := range files {
 		if f.IsDir() {
 			continue
 		}
-		name := l.timeFromName(f.Name(), prefix, ext)
-		if name == "" {
+
+		// Note that timeFromName() will check both compressed and uncompressed
+		// log files and if there is a timestamp in the filename it will find it
+		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
+			var statTime time.Time
+			statInfo, statErr := osStat(filepath.Join(l.dir(), f.Name()))
+			if statErr != nil {
+				statInfo, statErr = osStat(filepath.Join(l.dir(), f.Name() + compressSuffix))
+			}
+			if statErr == nil {
+				statTime = statInfo.ModTime()
+			}
+			logFiles = append(logFiles, logInfo{statTime, t, f})
 			continue
-		}
-	mutex.RLock()
-	defer mutex.RUnlock()
-		t, err := time.Parse(backupTimeFormat, name)
-		if err == nil {
-			logFiles = append(logFiles, logInfo{t, f})
 		}
 		// error parsing means that the suffix at the end was not generated
 		// by lumberjack, and therefore it's not a backup file.
@@ -410,25 +530,44 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 
 // timeFromName extracts the formatted time from the filename by stripping off
 // the filename's prefix and extension. This prevents someone's filename from
-// confusing time.parse.
-func (l *Logger) timeFromName(filename, prefix, ext string) string {
-	if !strings.HasPrefix(filename, prefix) {
-		return ""
+// confusing time.Parse.
+func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
+	if !strings.HasPrefix(filename, prefix+ext) {
+		return time.Time{}, errors.New("incorrect prefix and extension")
 	}
-	filename = filename[len(prefix):]
+	filename = filename[len(prefix+ext):]
+	if len(filename) == 0 {
+		return time.Time{}, errors.New("no time extension found")
+	}
+	if strings.HasSuffix(filename, compressSuffix) {
+		filename = filename[:(len(filename) - len(compressSuffix))]
+	}
 
-	if !strings.HasSuffix(filename, ext) {
-		return ""
+	if uniqNumExtRegex.Match([]byte(filename)) {
+		result := uniqNumExtRegex.FindStringSubmatch(filename)
+		if len(result) >= 2 {
+			filename = result[1]
+		}
 	}
-	filename = filename[:len(filename)-len(ext)]
-	return filename
+
+	// If we make it here the filename will be ".<backuptime>"
+	ts := filename[1:]
+
+	return time.Parse(backupTimeFormat, ts)
 }
 
 // max returns the maximum size in bytes of log files before rolling.
 func (l *Logger) max() int64 {
-	if l.MaxSize == 0 {
+	// -1 is a test value that indicates rotate the file *now* based on
+	// file size... it does that by making the max 0 bytes so writing
+	// anything will exceed that
+	if l.MaxSize == -1 {
+		return int64(0)
+	} else if l.MaxSize == 0 {
+		// if 0 it means it is unset so go ith the default size (100MB)
 		return int64(defaultMaxSize * megabyte)
 	}
+	// Otherwise go with the given maxsize MB (eg: 2000 = 2000 * 1MB = 2GB)
 	return int64(l.MaxSize) * int64(megabyte)
 }
 
@@ -442,13 +581,69 @@ func (l *Logger) dir() string {
 func (l *Logger) prefixAndExt() (prefix, ext string) {
 	filename := filepath.Base(l.filename())
 	ext = filepath.Ext(filename)
-	prefix = filename[:len(filename)-len(ext)] + "-"
+	prefix = filename[:len(filename)-len(ext)]
 	return prefix, ext
+}
+
+// compressLogFile compresses the given log file, removing the
+// uncompressed log file if successful.
+func compressLogFile(src, dst string) (err error) {
+	f, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open log file: %v", err)
+	}
+	defer f.Close()
+
+	fi, err := osStat(src)
+	if err != nil {
+		return fmt.Errorf("failed to stat log file: %v", err)
+	}
+
+	if err := chown(dst, fi); err != nil {
+		return fmt.Errorf("failed to chown compressed log file: %v", err)
+	}
+
+	// If this file already exists, we presume it was created by
+	// a previous attempt to compress the log file.
+	gzf, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, fi.Mode())
+	if err != nil {
+		return fmt.Errorf("failed to open compressed log file: %v", err)
+	}
+	defer gzf.Close()
+
+	gz := gzip.NewWriter(gzf)
+
+	defer func() {
+		if err != nil {
+			os.Remove(dst)
+			err = fmt.Errorf("failed to compress log file: %v", err)
+		}
+	}()
+
+	if _, err := io.Copy(gz, f); err != nil {
+		return err
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if err := gzf.Close(); err != nil {
+		return err
+	}
+
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Remove(src); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // logInfo is a convenience struct to return the filename and its embedded
 // timestamp.
 type logInfo struct {
+	stattime time.Time
 	timestamp time.Time
 	os.FileInfo
 }
@@ -457,6 +652,9 @@ type logInfo struct {
 type byFormatTime []logInfo
 
 func (b byFormatTime) Less(i, j int) bool {
+	if b[i].timestamp.Equal(b[j].timestamp) {
+		return b[i].stattime.After(b[j].stattime)
+	}
 	return b[i].timestamp.After(b[j].timestamp)
 }
 
@@ -469,7 +667,7 @@ func (b byFormatTime) Len() int {
 }
 
 // BackupTimeFormat gets the current backup time format
-func (l *Logger) BackupTimeFormat() (string) {
+func (l *Logger) BackupTimeFormat() string {
 	mutex.RLock()
 	defer mutex.RUnlock()
 	return backupTimeFormat
@@ -477,10 +675,9 @@ func (l *Logger) BackupTimeFormat() (string) {
 
 // SetBackupTimeFormat allows a client of lumberjack to override the default
 // time format for naming when rotating log files, default time format is
-// currently: "2006-01-02T15-04-05.000" (see godoc for time package, Parse())
+// currently: "2006-01-02" (see godoc for time package, Parse())
 func (l *Logger) SetBackupTimeFormat(format string) {
 	mutex.Lock()
 	defer mutex.Unlock()
 	backupTimeFormat = format
 }
-

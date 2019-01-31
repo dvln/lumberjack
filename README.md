@@ -1,14 +1,24 @@
-# lumberjack  [![GoDoc](https://godoc.org/gopkg.in/natefinch/lumberjack.v2?status.png)](https://godoc.org/gopkg.in/natefinch/lumberjack.v2) [![Build Status](https://drone.io/github.com/natefinch/lumberjack/status.png)](https://drone.io/github.com/natefinch/lumberjack/latest) [![Build status](https://ci.appveyor.com/api/projects/status/00gchpxtg4gkrt5d)](https://ci.appveyor.com/project/natefinch/lumberjack) [![Coverage Status](https://coveralls.io/repos/natefinch/lumberjack/badge.svg?branch=v2.0)](https://coveralls.io/r/natefinch/lumberjack?branch=v2.0)
-
-# Deprecated
-
-This package, Luberjack (effectively v1) is deprecated in favor of v2 of Lumberjack, available from gopkg.in/natefinch/lumberjack.v2 (which redirects to the v2 branch of this repo).
-
-Developerment will not continue on this branch, and it is highly recommended that you migrate to v2.
+# lumberjack  [![GoDoc](https://godoc.org/gopkg.in/natefinch/lumberjack.v2?status.png)](https://godoc.org/gopkg.in/natefinch/lumberjack.v2) [![Build Status](https://travis-ci.org/natefinch/lumberjack.svg?branch=v2.0)](https://travis-ci.org/natefinch/lumberjack) [![Build status](https://ci.appveyor.com/api/projects/status/00gchpxtg4gkrt5d)](https://ci.appveyor.com/project/natefinch/lumberjack) [![Coverage Status](https://coveralls.io/repos/natefinch/lumberjack/badge.svg?branch=v2.0)](https://coveralls.io/r/natefinch/lumberjack?branch=v2.0)
 
 ### Lumberjack is a Go package for writing logs to rolling files.
 
 Package lumberjack provides a rolling logger.
+
+Note: Local modifications to lumberjack are accessed from the master branch in
+this git repo if you want to use this vendored copy:
+
+    import "github.com/dvln/lumberjack"
+
+The primary difference of this version is that the name of the log files are
+a little differently structured and it has a feature to do daily rotation of
+the log file as well as allow a simple date extension on the log file without
+time... and can handle multiple log files of the same name on the same date
+(such as if the file exceeds the desired max size of the file).  There is
+more detail on this below (see Note1, Note2 and Note3 below).
+
+If you want to use the original version of this tool (from Nate Finch on github) then
+read the below branch and import information as that is from the original package which
+is using the v2.0 branch.
 
 Note that this is v2.0 of lumberjack, and should be imported using gopkg.in
 thusly:
@@ -39,14 +49,48 @@ Code:
 
 ```go
 log.SetOutput(&lumberjack.Logger{
-    Filename:   "/var/log/myapp/foo.log",
-    MaxSize:    500, // megabytes
-    MaxBackups: 3,
-    MaxAge:     28, //days
+    Filename:    "/var/log/myapp/foo.log",
+    MaxSize:     500, // megabytes
+    MaxBackups:  3,
+    DailyRotate: true, // disabled by default
+    LocalTime:   true, // disabled by default
+    MaxAge:      28, //days
+    Compress:    true, // disabled by default
 })
 ```
 
+Note1: DailyRotate is an local addition.  It is used to rotate log files at midnight
+       local time so it kind of follows Apache and other logs file formats with
+       nightly rotation to make it easy to group log files by a given days activity.
+       It should be noted that the default log file naming is different than in the
+       central copy of this package, see next note.
 
+Note2: For dvln purposes the default log format is like tool.log[.2019-01-15[--<#>][.gz]]
+       so as to make the date quite clear.  If the MaxSize is exceeded within that day
+       then the "--<#>" will kick in to keep the log file names unique within that day
+       (the central copy of this pkg will just overwrite the prior archived log file
+       if the size is reached on the same day if using a simple date extension, but
+       that is only because it defaults to a hard coded date/time, down to milliseconds,
+       and doesn't really have to worry about naming collisions due to that fact, so
+       the "--#" optional extension is unique to this copy of the package as well).
+       This copy of the package offer some API's to tweak the default date/time format
+       more dynamically... but the default is to just identify the date without time
+       details.  Note that the .gz (gzip) extension is only seen when compression is
+       turned on.  The "former" central lumberjack log name format, which you might
+       see in the below docs, was "tool[-2019-01-15T10-15-33.021].log[.gz]"... that
+       exact format is no longer available but tool.log[.2019-01-15T10-15-33.021[.gz]]
+       is available if one wants more detailed date/time still (see new API's to set
+       the backup time format).  Anyhow, the point is that this files contents haven't
+       been updated beyond these notes so you might want to keep that in mind.
+
+Note3: The v2 branch in nate finch's central copy of this pkg is the latest public code
+       to use at the time of this writing.  The v2 branch in this repo is "pristine" and
+       tracks that (although it will grow out of date, I tend to update it if I want
+       to merge in some features... most recently, compression).  So, if you want to
+       bring in new changes from the standard repo put it in v2 cleanly and then
+       merge that into the locally hacked version on master.  It should be noted
+       that if the changes are big you might have a fair chunk of work in front of
+       you since this has been changed a fair amount.
 
 ## type Logger
 ``` go
@@ -76,6 +120,10 @@ type Logger struct {
     // backup files is the computer's local time.  The default is to use UTC
     // time.
     LocalTime bool `json:"localtime" yaml:"localtime"`
+
+    // Compress determines if the rotated log files should be compressed
+    // using gzip. The default is not to perform compression.
+    Compress bool `json:"compress" yaml:"compress"`
     // contains filtered or unexported fields
 }
 ```
@@ -92,6 +140,14 @@ Whenever a write would cause the current log file exceed MaxSize megabytes,
 the current file is closed, renamed, and a new log file created with the
 original name. Thus, the filename you give Logger is always the "current" log
 file.
+
+Backups use the log file name given to Logger, in the form `name-timestamp.ext`
+where name is the filename without the extension, timestamp is the time at which
+the log was rotated formatted with the time.Time format of
+`2006-01-02T15-04-05.000` and the extension is the original extension.  For
+example, if your Logger.Filename is `/var/log/foo/server.log`, a backup created
+at 6:30pm on Nov 11 2016 would use the filename
+`/var/log/foo/server-2016-11-04T18-30-00.000.log`
 
 ### Cleaning Up Old Log Files
 Whenever a new logfile gets created, old log files may be deleted.  The most
