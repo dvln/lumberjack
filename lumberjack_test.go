@@ -998,10 +998,17 @@ compress = true`[1:]
 // colliding, and must be cleaned up after the test is finished.
 func makeTempDir(name string, t testing.TB) string {
 	mutex.RLock()
-	dir := time.Now().Format(name + backupTimeFormat)
+	useTimeFmt := "2006-01-02T15-04-05.000"
+	dir := time.Now().Format(name + useTimeFmt)
 	mutex.RUnlock()
 	dir = filepath.Join(os.TempDir(), dir)
-	isNilUp(os.Mkdir(dir, 0700), t, 1)
+	_, err := os.Stat(dir)
+	if err == nil {
+		isNilUp(os.RemoveAll(dir), t, 1)
+	}
+	oldUmask := syscall.Umask(0)
+	defer syscall.Umask(oldUmask)
+	isNilUp(os.Mkdir(dir, 0770), t, 1)
 	return dir
 }
 
