@@ -90,8 +90,10 @@ func TestMaintainOwner(t *testing.T) {
 	err = l.Rotate()
 	isNil(err, t)
 
+	mutex.RLock()
 	equals(555, fakeFS.files[filename].uid, t)
 	equals(666, fakeFS.files[filename].gid, t)
+	mutex.RUnlock()
 }
 
 func TestCompressMaintainMode(t *testing.T) {
@@ -190,8 +192,10 @@ func TestCompressMaintainOwner(t *testing.T) {
 	// a compressed version of the log file should now exist with the correct
 	// owner.
 	filename2 := backupFile(dir)
+	mutex.RLock()
 	equals(555, fakeFS.files[filename2+compressSuffix].uid, t)
 	equals(666, fakeFS.files[filename2+compressSuffix].gid, t)
+	mutex.RUnlock()
 }
 
 type fakeFile struct {
