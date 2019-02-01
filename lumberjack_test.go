@@ -30,11 +30,15 @@ import (
 var fakeCurrentTime = time.Now()
 
 func fakeTime() time.Time {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return fakeCurrentTime
 }
 
 func TestNewFile(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 
 	dir := makeTempDir("TestNewFile", t)
 	defer os.RemoveAll(dir)
@@ -51,7 +55,9 @@ func TestNewFile(t *testing.T) {
 }
 
 func TestOpenExisting(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := makeTempDir("TestOpenExisting", t)
 	defer os.RemoveAll(dir)
 
@@ -80,8 +86,11 @@ func TestOpenExisting(t *testing.T) {
 }
 
 func TestWriteTooLong(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
+
 	dir := makeTempDir("TestWriteTooLong", t)
 	defer os.RemoveAll(dir)
 	l := &Logger{
@@ -100,8 +109,12 @@ func TestWriteTooLong(t *testing.T) {
 }
 
 func TestMakeLogDir(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
+	mutex.RLock()
 	dir := time.Now().Format("TestMakeLogDir" + backupTimeFormat)
+	mutex.RUnlock()
 	dir = filepath.Join(os.TempDir(), dir)
 	defer os.RemoveAll(dir)
 	filename := logFile(dir)
@@ -118,7 +131,9 @@ func TestMakeLogDir(t *testing.T) {
 }
 
 func TestDefaultFilename(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := os.TempDir()
 	filename := filepath.Join(dir, filepath.Base(os.Args[0])+"-lumberjack.log")
 	defer os.Remove(filename)
@@ -133,8 +148,10 @@ func TestDefaultFilename(t *testing.T) {
 }
 
 func TestAutoRotate(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestAutoRotate", t)
 	defer os.RemoveAll(dir)
@@ -170,8 +187,10 @@ func TestAutoRotate(t *testing.T) {
 }
 
 func TestDailyRotate(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1024 * 1024
+	mutex.Unlock()
 
 	dir := makeTempDir("TestDailyRotate", t)
 	defer os.RemoveAll(dir)
@@ -197,7 +216,9 @@ func TestDailyRotate(t *testing.T) {
 	n, err := l.Write(b)
 	isNil(err, t)
 	equals(len(b), n, t)
+	mutex.RLock()
 	info, err := osStat(filename)
+	mutex.RUnlock()
 	isNil(err, t)
 	existsWithContent(filename, b, t)
 	fileCount(dir, 1, t)
@@ -207,10 +228,14 @@ func TestDailyRotate(t *testing.T) {
 	atime := mtime
 	err = os.Chtimes(filename, atime, mtime)
 	isNil(err, t)
+	mutex.RLock()
 	info, err = osStat(filename)
+	mutex.RUnlock()
 	isNil(err, t)
 	origModTime := info.ModTime() // 2 day old log file roughly
+	mutex.RLock()
 	origTimestamp := origModTime.Format(backupTimeFormat)
+	mutex.RUnlock()
 	basedir := filepath.Dir(filename)
 	nameonly := filepath.Base(filename)
 	ext := filepath.Ext(nameonly)
@@ -243,8 +268,11 @@ func TestDailyRotate(t *testing.T) {
 }
 
 func TestFirstWriteRotate(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
+
 	dir := makeTempDir("TestFirstWriteRotate", t)
 	defer os.RemoveAll(dir)
 
@@ -274,8 +302,11 @@ func TestFirstWriteRotate(t *testing.T) {
 }
 
 func TestMaxBackups(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
+
 	dir := makeTempDir("TestMaxBackups", t)
 	defer os.RemoveAll(dir)
 
@@ -417,8 +448,10 @@ func TestCleanupExistingBackups(t *testing.T) {
 	// test that if we start with more backup files than we're supposed to have
 	// in total, that extra ones get cleaned up when we rotate.
 
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestCleanupExistingBackups", t)
 	defer os.RemoveAll(dir)
@@ -472,8 +505,10 @@ func TestCleanupExistingBackups(t *testing.T) {
 }
 
 func TestMaxAge(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestMaxAge", t)
 	defer os.RemoveAll(dir)
@@ -539,8 +574,10 @@ func TestMaxAge(t *testing.T) {
 }
 
 func TestOldLogFiles(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestOldLogFiles", t)
 	defer os.RemoveAll(dir)
@@ -552,7 +589,9 @@ func TestOldLogFiles(t *testing.T) {
 
 	// This gives us a time with the same precision as the time we get from the
 	// timestamp in the name.
+	mutex.RLock()
 	t1, err := time.Parse(backupTimeFormat, fakeTime().UTC().Format(backupTimeFormat))
+	mutex.RUnlock()
 	isNil(err, t)
 
 	backup := backupFile(dir)
@@ -561,7 +600,9 @@ func TestOldLogFiles(t *testing.T) {
 
 	newFakeTime()
 
+	mutex.RLock()
 	t2, err := time.Parse(backupTimeFormat, fakeTime().UTC().Format(backupTimeFormat))
+	mutex.RUnlock()
 	isNil(err, t)
 
 	backup2 := backupFile(dir)
@@ -608,8 +649,10 @@ func TestTimeFromName(t *testing.T) {
 }
 
 func TestLocalTime(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestLocalTime", t)
 	defer os.RemoveAll(dir)
@@ -635,7 +678,9 @@ func TestLocalTime(t *testing.T) {
 }
 
 func TestRotate(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := makeTempDir("TestRotate", t)
 	defer os.RemoveAll(dir)
 
@@ -692,8 +737,10 @@ func TestRotate(t *testing.T) {
 }
 
 func TestCompressOnRotateAndExtensions(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestCompressOnRotate", t)
 	defer os.RemoveAll(dir)
@@ -826,8 +873,10 @@ func TestCompressOnRotateAndExtensions(t *testing.T) {
 }
 
 func TestCompressOnResume(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
 	megabyte = 1
+	mutex.Unlock()
 
 	dir := makeTempDir("TestCompressOnResume", t)
 	defer os.RemoveAll(dir)
@@ -948,7 +997,9 @@ compress = true`[1:]
 // It should be based on the name of the test, to keep parallel tests from
 // colliding, and must be cleaned up after the test is finished.
 func makeTempDir(name string, t testing.TB) string {
+	mutex.RLock()
 	dir := time.Now().Format(name + backupTimeFormat)
+	mutex.RUnlock()
 	dir = filepath.Join(os.TempDir(), dir)
 	isNilUp(os.Mkdir(dir, 0700), t, 1)
 	return dir
@@ -972,6 +1023,8 @@ func logFile(dir string) string {
 }
 
 func backupFile(dir string) string {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return filepath.Join(dir, "foobar.log."+fakeTime().UTC().Format(backupTimeFormat))
 }
 
@@ -980,16 +1033,22 @@ func backupFile(dir string) string {
 // avoid overwriting an log file that reached it's max size (useful if one is using a
 // backupTimeFormat that is date based without time, where name conflicts can happen)
 func backupFileExt(dir string, extNum int) string {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return filepath.Join(dir, "foobar.log."+fakeTime().UTC().Format(backupTimeFormat)+fmt.Sprintf("--%d", extNum))
 }
 
 func backupFileLocal(dir string) string {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return filepath.Join(dir, "foobar.log."+fakeTime().Format(backupTimeFormat))
 }
 
 // logFileLocal returns the log file name in the given directory for the current
 // fake time using the local timezone.
 func logFileLocal(dir string) string {
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return filepath.Join(dir, fakeTime().Format(backupTimeFormat))
 }
 
@@ -1003,7 +1062,9 @@ func fileCount(dir string, exp int, t testing.TB) {
 
 // newFakeTime sets the fake "current time" to two days later.
 func newFakeTime() {
+	mutex.Lock()
 	fakeCurrentTime = fakeCurrentTime.Add(time.Hour * 24 * 2)
+	mutex.Unlock()
 }
 
 func notExist(path string, t testing.TB) {

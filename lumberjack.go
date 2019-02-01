@@ -152,7 +152,9 @@ var (
 // Note: this is expected to be within a l.mu.Lock() from a caller
 func (l *Logger) newDayDetected() bool {
 	haveNewDay := false
+	mutex.RLock()
 	info, err := osStat(l.filename())
+	mutex.RUnlock()
 	if err == nil {
 		currTime := time.Now()
 		modTime := info.ModTime()
@@ -261,7 +263,9 @@ func (l *Logger) openNew() error {
 
 	name := l.filename()
 	mode := os.FileMode(0664)
+	mutex.RLock()
 	info, err := osStat(name)
+	mutex.RUnlock()
 	if err == nil {
 		// copy the mode off the old logfile, generate time/date log file name,
 		// make sure it has a unique name so we do not overwrite a log file
@@ -276,15 +280,19 @@ func (l *Logger) openNew() error {
 		// and even milliseconds in play then this will not be used of course)
 		mode = info.Mode()
 		newname := l.backupName(name)
+		mutex.RLock()
 		_, err = osStat(newname)
 		_, err2 := osStat(newname + compressSuffix)
+		mutex.RUnlock()
 		if err == nil || err2 == nil {
 			// if a regular or compressed copy of the backupName is already in use
 			// then we'll need to add an extension before the rename happens..
 			for i := 0; i < 100; i++ {
 				checkName := fmt.Sprintf("%s--%d", newname, i+1)
+				mutex.RLock()
 				_, err = osStat(checkName)
 				_, err2 = osStat(checkName + compressSuffix)
+				mutex.RUnlock()
 				if err != nil && err2 != nil {
 					newname = checkName
 					break
@@ -357,7 +365,9 @@ func (l *Logger) openExistingOrNew(writeLen int) error {
 	l.mill()
 
 	filename := l.filename()
+	mutex.RLock()
 	info, err := osStat(filename)
+	mutex.RUnlock()
 	if os.IsNotExist(err) {
 		return l.openNew()
 	}
@@ -509,10 +519,12 @@ func (l *Logger) oldLogFiles() ([]logInfo, error) {
 		// log files and if there is a timestamp in the filename it will find it
 		if t, err := l.timeFromName(f.Name(), prefix, ext); err == nil {
 			var statTime time.Time
+			mutex.RLock()
 			statInfo, statErr := osStat(filepath.Join(l.dir(), f.Name()))
 			if statErr != nil {
-				statInfo, statErr = osStat(filepath.Join(l.dir(), f.Name() + compressSuffix))
+				statInfo, statErr = osStat(filepath.Join(l.dir(), f.Name()+compressSuffix))
 			}
+			mutex.RUnlock()
 			if statErr == nil {
 				statTime = statInfo.ModTime()
 			}
@@ -552,8 +564,11 @@ func (l *Logger) timeFromName(filename, prefix, ext string) (time.Time, error) {
 
 	// If we make it here the filename will be ".<backuptime>"
 	ts := filename[1:]
+	mutex.RLock()
+	timeFmt := backupTimeFormat
+	mutex.RUnlock()
 
-	return time.Parse(backupTimeFormat, ts)
+	return time.Parse(timeFmt, ts)
 }
 
 // max returns the maximum size in bytes of log files before rolling.
@@ -565,9 +580,13 @@ func (l *Logger) max() int64 {
 		return int64(0)
 	} else if l.MaxSize == 0 {
 		// if 0 it means it is unset so go ith the default size (100MB)
+		mutex.RLock()
+		defer mutex.RUnlock()
 		return int64(defaultMaxSize * megabyte)
 	}
 	// Otherwise go with the given maxsize MB (eg: 2000 = 2000 * 1MB = 2GB)
+	mutex.RLock()
+	defer mutex.RUnlock()
 	return int64(l.MaxSize) * int64(megabyte)
 }
 
@@ -594,7 +613,9 @@ func compressLogFile(src, dst string) (err error) {
 	}
 	defer f.Close()
 
+	mutex.RLock()
 	fi, err := osStat(src)
+	mutex.RUnlock()
 	if err != nil {
 		return fmt.Errorf("failed to stat log file: %v", err)
 	}

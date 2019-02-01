@@ -10,7 +10,9 @@ import (
 )
 
 func TestMaintainMode(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := makeTempDir("TestMaintainMode", t)
 	defer os.RemoveAll(dir)
 
@@ -50,13 +52,19 @@ func TestMaintainMode(t *testing.T) {
 
 func TestMaintainOwner(t *testing.T) {
 	fakeFS := newFakeFS()
+	mutex.Lock()
 	osChown = fakeFS.Chown
 	osStat = fakeFS.Stat
+	mutex.Unlock()
 	defer func() {
+		mutex.Lock()
 		osChown = os.Chown
 		osStat = os.Stat
+		mutex.Unlock()
 	}()
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := makeTempDir("TestMaintainOwner", t)
 	defer os.RemoveAll(dir)
 
@@ -87,7 +95,9 @@ func TestMaintainOwner(t *testing.T) {
 }
 
 func TestCompressMaintainMode(t *testing.T) {
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 
 	dir := makeTempDir("TestCompressMaintainMode", t)
 	defer os.RemoveAll(dir)
@@ -134,13 +144,19 @@ func TestCompressMaintainMode(t *testing.T) {
 
 func TestCompressMaintainOwner(t *testing.T) {
 	fakeFS := newFakeFS()
+	mutex.Lock()
 	osChown = fakeFS.Chown
 	osStat = fakeFS.Stat
+	mutex.Unlock()
 	defer func() {
+		mutex.Lock()
 		osChown = os.Chown
 		osStat = os.Stat
+		mutex.Unlock()
 	}()
+	mutex.Lock()
 	currentTime = fakeTime
+	mutex.Unlock()
 	dir := makeTempDir("TestCompressMaintainOwner", t)
 	defer os.RemoveAll(dir)
 

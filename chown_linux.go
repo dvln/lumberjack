@@ -15,5 +15,8 @@ func chown(name string, info os.FileInfo) error {
 	}
 	f.Close()
 	stat := info.Sys().(*syscall.Stat_t)
-	return osChown(name, int(stat.Uid), int(stat.Gid))
+	mutex.RLock()
+	err = osChown(name, int(stat.Uid), int(stat.Gid))
+	mutex.RUnlock()
+	return err
 }
